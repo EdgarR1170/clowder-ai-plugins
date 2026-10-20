@@ -13,6 +13,7 @@ export async function readStatus({ signal } = {}) {
       config: { defaultOutputDirectory: defaultRoot, directorySource: 'per_call' },
       auth: { status: bridge.authorized?.length ? 'authorized' : 'disconnected', pages: bridge.authorized ?? [] },
       live: { status: 'connected', observedVersion: bridge.version },
+      workspace: { authorized: bridge.workspaceAuthorized === true, requiresSeparateChromeGrant: true },
       sharedLinks: { requiresLogin: false },
     };
   } catch (error) {
