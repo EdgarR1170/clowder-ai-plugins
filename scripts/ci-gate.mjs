@@ -97,6 +97,10 @@ export function buildGateSteps() {
       command: chain('@clowder-ai/feishu-meeting-intake', ['typecheck', 'test', 'lint', 'build']),
     },
     {
+      name: 'Tripo standalone package and locked consumer',
+      command: chain('@clowder-ai/tripo-studio', ['build', 'test', 'lint']),
+    },
+    {
       name: 'Video analysis gates',
       command: chain('@clowder-ai/video-analysis', ['typecheck', 'test', 'lint', 'build']),
     },
