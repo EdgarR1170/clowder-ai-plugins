@@ -31,7 +31,7 @@
     "typecheck": "tsc -p tsconfig.build.json --noEmit && tsc -p tsconfig.test.json",
     "test": "pnpm --filter @clowder-ai/plugin-contract build && pnpm --filter @clowder-ai/plugin-sdk build && pnpm build && node --import tsx --test src/**/*.test.ts test/*.test.ts",
     "lint": "tsc -p tsconfig.build.json --noEmit && tsc -p tsconfig.test.json",
-    "clean": "rm -rf dist",
+    "clean": "node ../../scripts/clean-path.mjs dist",
     "prepack": "pnpm build",
     "test:module": "pnpm --filter @clowder-ai/plugin-contract build && pnpm --filter @clowder-ai/plugin-sdk build && pnpm build && node --import tsx --test test/*.test.ts"
   },
