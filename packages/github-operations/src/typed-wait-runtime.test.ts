@@ -5,6 +5,7 @@ import type { FeatureContext, PluginActionContext, PluginTaskItem, PluginStorage
 import { TypedWaitRuntime } from './typed-wait-runtime.js';
 import type { GitHubSnapshot } from './tracking-runtime.js';
 import type { GitHubPrAwaitStateV1 } from './business/model/types/github-wait.js';
+import { executeGitHubRequest } from './business/infrastructure/github/request-budget.js';
 
 function fixture() {
   const rows = new Map<string, PluginStorageEntry>();
@@ -41,6 +42,154 @@ function fixture() {
     snapshot: () => snapshot };
 }
 const input = { registrationId: 'registration', repoFullName: 'owner/repo', prNumber: 1 };
+
+for (const kind of ['pr', 'issue'] as const) test(`${kind}: native registration admits its live baseline ahead of queued collection`, async () => {
+  const f = fixture(), runtime = new TypedWaitRuntime(f.options);
+  const order: string[] = [];
+  let release!: () => void, entered!: () => void, baselineEntered!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const baselineStarted = new Promise<void>(resolve => { baselineEntered = resolve; });
+  const options = { ghToken: `registration-queue-${kind}`, execFileAsync: async (_file: string, args: string[]) => {
+    order.push(args[1]!);
+    if (args[1] === 'running') { entered(); await blocked; }
+    return { stdout: '{}' };
+  } };
+  const first = executeGitHubRequest(['api', 'running'], options); await started;
+  const background = Array.from({ length: 6 }, (_, i) => executeGitHubRequest(['api', `poll-${i}`], options));
+  f.defer(async () => {
+    baselineEntered(); await executeGitHubRequest(['api', 'native-baseline'], options);
+    return f.snapshot();
+  });
+  const registration = kind === 'pr' ? runtime.registerPr(input, f.caller) :
+    runtime.registerIssue({ registrationId: 'registration', repoFullName: 'owner/repo', issueNumber: 1 }, f.caller);
+  await baselineStarted; await new Promise(resolve => setImmediate(resolve));
+  release();
+  try {
+    const task = await registration;
+    await Promise.all([first, ...background]);
+    assert.equal(order[1], 'native-baseline', 'registration must carry interactive admission through the real provider read');
+    assert.equal(task.automationState?.await?.generation, 1);
+    assert.deepEqual(await (kind === 'pr' ? runtime.registerPr(input, f.caller) :
+      runtime.registerIssue({ registrationId: 'registration', repoFullName: 'owner/repo', issueNumber: 1 }, f.caller)), task);
+    assert.equal(f.reads(), 1, 'stable replay does not freeze another baseline');
+    assert.equal(f.hostTaskCalls(), 0); assert.equal(f.sent.length, 0);
+  } finally { release(); await runtime.stop(); }
+});
+
+test('a typed poll yields within its budget and resumes the next subscription after restart', async () => {
+  const f = fixture(); let now = 1000;
+  const options = { ...f.options, now: () => now, pollBudgetMs: 2000 };
+  let runtime = new TypedWaitRuntime(options);
+  const first = await runtime.registerIssue({ registrationId: 'one', repoFullName: 'owner/repo', issueNumber: 1 }, f.caller);
+  const second = await runtime.registerIssue({ registrationId: 'two', repoFullName: 'owner/repo', issueNumber: 2 }, f.caller);
+  const originals = new Map([first, second].map(task => [task.id, structuredClone(task.automationState)]));
+  const visited: number[] = [];
+  const provider = { read: async (target: { number: number }) => {
+    visited.push(target.number); now += 2000; return f.snapshot();
+  } };
+  await runtime.stop(); runtime = new TypedWaitRuntime({ ...options, provider });
+  await runtime.poll('issue'); assert.equal(visited.length, 1, 'a tick must not admit the entire backlog after its deadline');
+  await runtime.stop(); runtime = new TypedWaitRuntime({ ...options, provider });
+  await runtime.poll('issue'); assert.equal(visited.length, 2);
+  assert.notEqual(visited[0], visited[1], 'restart preserves admission fairness rather than restarting at the first wait');
+  for (const task of [first, second]) {
+    const current = await runtime.store.get(task.id);
+    assert.deepEqual(current?.automationState?.await, originals.get(task.id)?.await, 'no new baseline or generation');
+  }
+  assert.equal(f.sent.length, 0); assert.equal(f.hostTaskCalls(), 0);
+  await runtime.stop();
+});
+
+test('CI batching consumes the same typed poll budget before any per-PR observation', async () => {
+  const f = fixture(); let now = 1000, reads = 0;
+  let runtime = new TypedWaitRuntime(f.options);
+  const task = await runtime.registerPr(input, f.caller); await runtime.stop();
+  runtime = new TypedWaitRuntime({ ...f.options, now: () => now, pollBudgetMs: 2000,
+    provider: { read: async () => { throw new Error('Unscoped read'); },
+      forCiBatch: async () => { now += 2000; return { read: async () => { reads++; return f.snapshot(); } }; } } });
+  await runtime.poll('pr'); assert.equal(reads, 0, 'spent batch budget cannot admit another observation');
+  assert.deepEqual((await runtime.store.get(task.id))?.automationState, task.automationState);
+  await runtime.stop();
+});
+
+test('the last subscription cut short by the poll budget gets a full slot next tick', async () => {
+  const f = fixture(); let now = 1000, truncated = false;
+  const visited: number[] = [];
+  let runtime = new TypedWaitRuntime(f.options);
+  await runtime.registerIssue({ registrationId: 'one', repoFullName: 'owner/repo', issueNumber: 1 }, f.caller);
+  await runtime.registerIssue({ registrationId: 'two', repoFullName: 'owner/repo', issueNumber: 2 }, f.caller);
+  await runtime.stop();
+  runtime = new TypedWaitRuntime({ ...f.options, now: () => now, pollBudgetMs: 10_000,
+    provider: { read: async target => {
+      visited.push(target.number);
+      if (target.number === 2 && !truncated) {
+        truncated = true; now += 4000; throw new DOMException('Tick budget exhausted', 'TimeoutError');
+      }
+      now += target.number === 1 ? 6000 : 1000;
+      return f.snapshot();
+    } } });
+  await runtime.poll('issue'); assert.deepEqual(visited, [1, 2]);
+  await runtime.poll('issue'); assert.equal(visited[2], 2, 'advancing past a truncated tail can starve that same position every cycle');
+  assert.equal(f.sent.length, 0); assert.equal(f.hostTaskCalls(), 0);
+  await runtime.stop();
+});
+
+test('a budget-clipped timer retains its target even before the clock reaches the soft deadline', async () => {
+  const f = fixture(); let now = 1000, truncated = false;
+  const visited: number[] = [];
+  let runtime = new TypedWaitRuntime(f.options);
+  await runtime.registerIssue({ registrationId: 'one', repoFullName: 'owner/repo', issueNumber: 1 }, f.caller);
+  await runtime.registerIssue({ registrationId: 'two', repoFullName: 'owner/repo', issueNumber: 2 }, f.caller);
+  await runtime.stop();
+  runtime = new TypedWaitRuntime({ ...f.options, now: () => now, pollBudgetMs: 5000, objectTimeoutMs: 1000,
+    provider: { read: async (target, signal) => {
+      visited.push(target.number);
+      if (!truncated && target.number === 1) now = 4499;
+      else if (!truncated) {
+        truncated = true;
+        await new Promise<void>((_resolve, reject) => {
+          const guard = setTimeout(() => reject(new Error('Expected clipped admission timer')), 100);
+          signal!.addEventListener('abort', () => { clearTimeout(guard); reject(signal!.reason); }, { once: true });
+        });
+      }
+      return f.snapshot();
+    } } });
+  await runtime.poll('issue'); assert.deepEqual(visited, [1, 2]);
+  assert.equal(now, 4499, 'the timer can fire one millisecond before the observed soft deadline');
+  await runtime.poll('issue');
+  assert.equal(visited[2], 2, 'a clipped timeout must not advance the durable cursor past its target');
+  assert.equal(f.sent.length, 0); assert.equal(f.hostTaskCalls(), 0);
+  await runtime.stop();
+});
+
+test('a full object timeout still rotates after cleanup crosses the poll deadline', async () => {
+  const f = fixture(); let now = 1000, failed = false;
+  const visited: number[] = [];
+  let runtime = new TypedWaitRuntime(f.options);
+  await runtime.registerIssue({ registrationId: 'one', repoFullName: 'owner/repo', issueNumber: 1 }, f.caller);
+  await runtime.registerIssue({ registrationId: 'two', repoFullName: 'owner/repo', issueNumber: 2 }, f.caller);
+  await runtime.stop();
+  runtime = new TypedWaitRuntime({ ...f.options, now: () => now, pollBudgetMs: 3000, objectTimeoutMs: 20,
+    provider: { read: async (target, signal) => {
+      visited.push(target.number);
+      if (!failed) {
+        failed = true;
+        await new Promise<void>((_resolve, reject) => {
+          const guard = setTimeout(() => reject(new Error('Expected full object timer')), 100);
+          signal!.addEventListener('abort', () => {
+            clearTimeout(guard); now = 4000; reject(signal!.reason);
+          }, { once: true });
+        });
+      }
+      return f.snapshot();
+    } } });
+  await runtime.poll('issue');
+  await runtime.poll('issue');
+  assert.equal(visited[1], 2, 'cleanup cannot turn a complete failed slot into perpetual tail deferral');
+  assert.equal(f.sent.length, 0); assert.equal(f.hostTaskCalls(), 0);
+  await runtime.stop();
+});
 
 for (const authors of [['alice', 'bot[bot]'], ['bot[bot]', 'alice'], ['alice', 'bob', 'bot[bot]']]) {
   test(`mixed review authors are filtered independently before the poll is consumed (${authors.join(',')})`, async () => {

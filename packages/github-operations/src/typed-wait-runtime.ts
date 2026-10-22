@@ -14,6 +14,8 @@ import { legacyIssueOperationInput } from './legacy-issue-observations.js';
 import { readRegistrationDiagnostics, writeRegistrationDiagnostic, registrationFailureCode, diagnosticError, type DiagnosticError, type RegistrationDiagnostic } from './tracking-diagnostics.js';
 import { readNotificationFilter } from './notification-filter.js';
 import { assertMigratedWaitCurrent, projectMigratedWait } from './migration-host-wait.js';
+import { gitHubAdmissionCanContinue, gitHubObjectAdmission, gitHubObjectSignal, gitHubPollBudget } from './business/infrastructure/github/admission-budget.js';
+import { withInteractiveGitHubRequests } from './business/infrastructure/github/request-budget.js';
 
 export interface TypedWaitRuntimeOptions {
   readonly context: FeatureContext;
@@ -24,6 +26,7 @@ export interface TypedWaitRuntimeOptions {
   readonly now?: () => number;
   /** Bound each PR independently inside the bounded poll; tests may shorten it. */
   readonly objectTimeoutMs?: number;
+  readonly pollBudgetMs?: number;
 }
 
 /** Package-private subscriptions, predicates, receipts and durable notification outboxes.
@@ -34,7 +37,6 @@ export class TypedWaitRuntime {
   private readonly lanes = new Map<string, Promise<unknown>>();
   private readonly work = new Set<Promise<unknown>>();
   private readonly polling = new Map<string, Promise<void>>();
-  private readonly offsets = new Map<string, number>();
   private readonly now: () => number;
   constructor(private readonly options: TypedWaitRuntimeOptions) {
     this.now = options.now ?? Date.now;
@@ -101,7 +103,7 @@ export class TypedWaitRuntime {
     const number = (kind === 'pr' ? value.prNumber : value.issueNumber)!;
     const subject = `${kind}:${value.repoFullName.toLowerCase()}#${number}`;
     const registrationId = (input as { registrationId: string }).registrationId;
-    return this.run(subject, async signal => {
+    return withInteractiveGitHubRequests(() => this.run(subject, async signal => {
       let phase: RegistrationDiagnostic['phase'] = 'load_subscription';
       const diagnostic = async (status: RegistrationDiagnostic['status'], code: RegistrationDiagnostic['code'], statusCode?: number, error?: DiagnosticError) => {
         try { await writeRegistrationDiagnostic(this.options.context.storage, caller, registrationId, subject,
@@ -159,7 +161,7 @@ export class TypedWaitRuntime {
         this.options.context.log('warn', `GitHub tracking registration failed (${code}, ${phase})`, { error: detail });
         throw error;
       }
-    });
+    }));
   }
 
   diagnostics() { return readRegistrationDiagnostics(this.options.context.storage); }
@@ -215,8 +217,19 @@ export class TypedWaitRuntime {
   poll(kind: 'pr' | 'issue'): Promise<void> {
     const running = this.polling.get(kind); if (running) return running;
     const operation = this.run(`poll:${kind}`, async signal => {
-      const tasks = await this.store.listByKind(kind === 'pr' ? 'pr_tracking' : 'issue_tracking');
-      const start = (this.offsets.get(kind) ?? 0) % Math.max(tasks.length, 1);
+      // Return before the next minute tick; leave time for canonical gh child
+      // cleanup and Host RPC settlement inside the 90-second carrier deadline.
+      const budget = gitHubPollBudget(signal, { now: this.now,
+        pollBudgetMs: this.options.pollBudgetMs ?? 50_000,
+        objectTimeoutMs: this.options.objectTimeoutMs ?? 40_000 });
+      const tasks = (await this.store.listByKind(kind === 'pr' ? 'pr_tracking' : 'issue_tracking'))
+        .filter(task => task.automationState?.await || task.automationState?.waitOutcome?.delivery === 'pending');
+      if (!tasks.length) return;
+      const storage = this.options.context.storage, progressKey = `github.typed-wait.poll-cursor.${kind}`;
+      const progress = (await storage.get(progressKey))?.value;
+      if (progress !== undefined && typeof progress !== 'string') throw new Error('Invalid typed poll progress');
+      const resume = typeof progress === 'string' ? tasks.findIndex(task => task.id === progress) : -1;
+      const start = (resume + 1) % tasks.length;
       // Freeze only currently authorized, active wait targets for this tick.
       // This is a fact read, not native completion authority. Recheck below before
       // using it: a concurrent registration must not inherit an older snapshot.
@@ -227,6 +240,7 @@ export class TypedWaitRuntime {
       if (kind === 'pr' && provider.forCiBatch) {
         const targets: GitHubTarget[] = [];
         for (const task of selected) {
+          if (!gitHubAdmissionCanContinue(budget)) break;
           const wait = task.automationState?.await;
           if (!wait || (wait.expiresAt !== undefined && wait.expiresAt <= this.now())) continue;
           if (task.status === 'done') continue;
@@ -236,16 +250,17 @@ export class TypedWaitRuntime {
         }
         if (targets.length) {
           try { provider = await provider.forCiBatch(targets,
-            AbortSignal.any([signal, AbortSignal.timeout(this.options.objectTimeoutMs ?? 10_000)])); }
+            gitHubObjectSignal(budget)!); }
           catch (error) { batchError = error; }
         }
         signal.throwIfAborted();
       }
-      for (let i = 0; i < selected.length && !signal.aborted; i++) {
+      for (let i = 0; i < selected.length && !signal.aborted && gitHubAdmissionCanContinue(budget); i++) {
         const task = selected[i]!;
-        this.offsets.set(kind, (start + i + 1) % tasks.length);
+        const admission = gitHubObjectAdmission(budget), objectSignal = admission.signal!;
+        let deferred = false;
         await this.run(task.subjectKey!, async taskSignal => {
-          const check = async () => { this.assertRunning(); signal.throwIfAborted(); taskSignal.throwIfAborted(); };
+          const check = async () => { this.assertRunning(); signal.throwIfAborted(); taskSignal.throwIfAborted(); objectSignal.throwIfAborted(); };
           const current = await this.store.get(task.id); if (!current) return;
           await this.currentSubscription(current);
           const lifecycle = this.lifecycle(current, check);
@@ -261,7 +276,7 @@ export class TypedWaitRuntime {
           const target = waitTarget(current);
           if (kind === 'pr' && this.options.provider.forCiBatch &&
               batchGenerations.get(task.id) !== current.automationState.await.generation) return;
-          const snapshot = await provider.read(target, AbortSignal.any([signal, taskSignal]));
+          const snapshot = await provider.read(target, AbortSignal.any([signal, taskSignal, objectSignal]));
           await check();
           const configured = await this.options.context.config.get('cloudReviewerLogins');
           if (configured !== undefined && typeof configured !== 'string') throw new TypeError('cloudReviewerLogins must be a string');
@@ -273,9 +288,25 @@ export class TypedWaitRuntime {
           const notificationFilter = await readNotificationFilter(this.options.context, snapshot, observed.observation.facts.review?.reviewer);
           await lifecycle.observe({ ...observed.observation, notificationFilter });
           await this.projectImportedWait(task.id, check);
-        }, this.options.objectTimeoutMs ?? 10_000).catch(() => this.options.context.log('warn', 'GitHub observation failed; wait and pending delivery remain recoverable'));
+        }, this.options.objectTimeoutMs ?? 40_000).catch(error => {
+          // A clipped timer can fire before Date.now reaches its deadline.
+          // Preserve the admitted window's cause rather than inferring it later.
+          deferred = objectSignal.aborted ? admission.limitedByPoll : !gitHubAdmissionCanContinue(budget);
+          this.options.context.log(deferred ? 'info' : 'warn', deferred
+            ? 'GitHub poll budget used; resume this subscription next tick'
+            : 'GitHub observation failed; wait and pending delivery remain recoverable',
+            { taskId: task.id, kind, errorName: error instanceof Error && ['AbortError', 'TimeoutError'].includes(error.name) ? error.name : 'Error' });
+        });
+        if (signal.aborted || deferred) break;
+        // Failed observations advance admission fairness, never provider facts.
+        // Preserve this position across module upgrades and process restarts.
+        const cursor = await storage.get(progressKey);
+        if (!(await storage.compareAndSet(progressKey, cursor?.revision ?? null, task.id)).applied) {
+          this.options.context.log('warn', 'Typed poll progress could not be saved; retain subscriptions for retry');
+          break;
+        }
       }
-    });
+    }, 55_000);
     this.polling.set(kind, operation);
     void operation.finally(() => this.polling.delete(kind)).catch(() => undefined);
     return operation;
