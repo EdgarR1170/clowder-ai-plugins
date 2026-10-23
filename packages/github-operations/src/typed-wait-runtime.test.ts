@@ -191,6 +191,443 @@ test('a full object timeout still rotates after cleanup crosses the poll deadlin
   await runtime.stop();
 });
 
+test('an author inline reply does not become a review-decision notification through its COMMENTED review', async () => {
+  const f = fixture();
+  const baselineReview = { id: 3, author: 'maintainer', state: 'CHANGES_REQUESTED', commitId: f.snapshot().headSha };
+  f.setSnapshot({ ...f.snapshot(), reviews: [baselineReview] });
+  const runtime = new TypedWaitRuntime(f.options);
+  try {
+    const tracked = await runtime.registerPr(input, f.caller);
+    const selfReplyReview = { id: 4, author: 'self', state: 'COMMENTED', commitId: f.snapshot().headSha };
+    f.setSnapshot({ ...f.snapshot(),
+      comments: [{ id: 20, author: 'self', body: 'fixed', commentType: 'inline', reviewId: 4 }],
+      reviews: [baselineReview, selfReplyReview] });
+
+    await runtime.poll('pr');
+    assert.equal(f.sent.length, 0, 'the reply and its synthetic COMMENTED review are both self-noise');
+    assert.equal((await runtime.store.get(tracked.id))?.automationState?.review?.lastDecisionCursor, 4,
+      'filtered review history is still consumed');
+    await runtime.poll('pr');
+    assert.equal(f.sent.length, 0, 'consumed self-noise is not replayed');
+
+    const approval = { id: 5, author: 'maintainer', state: 'APPROVED', commitId: f.snapshot().headSha };
+    f.setSnapshot({ ...f.snapshot(), reviews: [baselineReview, selfReplyReview, approval] });
+    await runtime.poll('pr');
+    assert.equal(f.sent.length, 1, 'a formal maintainer verdict still notifies');
+    assert.match(JSON.stringify(f.sent[0]), /review:5/);
+    assert.doesNotMatch(JSON.stringify(f.sent[0]), /review:4/);
+  } finally { await runtime.stop(); }
+});
+
+for (const verdict of ['APPROVED', 'CHANGES_REQUESTED'] as const) {
+  test(`a baseline PENDING review notifies when the same id becomes ${verdict}`, async () => {
+    const f = fixture();
+    const pending = { id: 10, author: 'maintainer', state: 'PENDING', commitId: f.snapshot().headSha };
+    f.setSnapshot({ ...f.snapshot(), reviews: [pending] });
+    const runtime = new TypedWaitRuntime(f.options);
+    try {
+      const tracked = await runtime.registerPr({ ...input, when: [{ kind: 'pr_review_decision_changed' }] }, f.caller);
+      f.setSnapshot({ ...f.snapshot(), reviews: [{ ...pending, state: verdict }] });
+
+      await runtime.poll('pr');
+      assert.equal(f.sent.length, 1, 'the first submitted verdict is news even though its review id was already collected');
+      assert.match(JSON.stringify(f.sent[0]), /review:10/);
+      assert.match(JSON.stringify(f.sent[0]), new RegExp(verdict));
+      const renewed = (await runtime.store.get(tracked.id))?.automationState?.await?.baseline;
+      assert.ok(renewed && 'headSha' in renewed);
+      assert.equal(renewed.review?.decisionCursor, 10, 'the raw collector cursor remains monotonic');
+      assert.equal(renewed.review?.verdicts?.['10']?.state, verdict);
+
+      await runtime.poll('pr');
+      assert.equal(f.sent.length, 1, 'the submitted verdict is not replayed after renewal');
+    } finally { await runtime.stop(); }
+  });
+
+  test(`a CI renewal after first seeing PENDING preserves the later same-id ${verdict}`, async () => {
+    const f = fixture();
+    const runtime = new TypedWaitRuntime(f.options);
+    try {
+      const tracked = await runtime.registerPr({ ...input, when: [
+        { kind: 'pr_review_decision_changed' },
+        { kind: 'pr_ci_terminal' },
+      ] }, f.caller);
+      const pending = { id: 10, author: 'maintainer', state: 'PENDING', commitId: f.snapshot().headSha };
+      f.setSnapshot({ ...f.snapshot(), ci: 'pass', reviews: [pending] });
+
+      await runtime.poll('pr');
+      assert.equal(f.sent.length, 1, 'CI is delivered while an unsubmitted review remains quiet');
+      assert.doesNotMatch(JSON.stringify(f.sent[0]), /review:10/);
+      const afterCi = (await runtime.store.get(tracked.id))?.automationState?.await?.baseline;
+      assert.ok(afterCi && 'headSha' in afterCi);
+      assert.equal(afterCi.review?.decisionCursor, 10);
+      assert.deepEqual(afterCi.review?.verdicts, {}, 'renewal remembers that id 10 had no submitted verdict');
+
+      f.setSnapshot({ ...f.snapshot(), reviews: [{ ...pending, state: verdict }] });
+      await runtime.poll('pr');
+      assert.equal(f.sent.length, 2, 'the later submitted verdict survives an unrelated renewal');
+      assert.match(JSON.stringify(f.sent[1]), /review:10/);
+      assert.match(JSON.stringify(f.sent[1]), new RegExp(verdict));
+      const afterVerdict = (await runtime.store.get(tracked.id))?.automationState?.await?.baseline;
+      assert.ok(afterVerdict && 'headSha' in afterVerdict);
+      assert.equal(afterVerdict.review?.decisionCursor, 10);
+      assert.equal(afterVerdict.review?.verdicts?.['10']?.state, verdict);
+
+      await runtime.poll('pr');
+      assert.equal(f.sent.length, 2, 'the submitted verdict is not replayed after renewal');
+    } finally { await runtime.stop(); }
+  });
+}
+
+const cloudTrigger = (createdAt: string) => ({
+  id: 5,
+  author: 'self',
+  body: '@codex review',
+  commentType: 'conversation' as const,
+  createdAt,
+});
+
+for (const state of ['APPROVED', 'CHANGES_REQUESTED'] as const) {
+  for (const timing of ['registration', 'ci-renewal'] as const) {
+    test(`an unanchored result wait reports same-id PENDING → ${state} after ${timing}`, async () => {
+      const f = fixture();
+      const pending = { id: 10, author: 'maintainer', state: 'PENDING', commitId: f.snapshot().headSha };
+      f.setSnapshot({ ...f.snapshot(), reviews: timing === 'registration' ? [pending] : [] });
+      let runtime = new TypedWaitRuntime(f.options);
+      try {
+        const tracked = await runtime.registerPr({ ...input, when: [
+          { kind: 'pr_review_result_available' },
+          ...(timing === 'ci-renewal' ? [{ kind: 'pr_ci_terminal' as const }] : []),
+        ] }, f.caller);
+        if (timing === 'ci-renewal') {
+          f.setSnapshot({ ...f.snapshot(), ci: 'pass', reviews: [pending] });
+          await runtime.poll('pr');
+          assert.equal(f.sent.length, 1, 'CI renewal consumes the PENDING id without treating it as a result');
+          assert.doesNotMatch(JSON.stringify(f.sent[0]), /review:10/);
+        }
+
+        f.setSnapshot({ ...f.snapshot(), reviews: [{ ...pending, state,
+          submittedAt: '2026-10-09T00:00:01.000Z' }] });
+        await runtime.poll('pr');
+        assert.equal(f.sent.length, timing === 'ci-renewal' ? 2 : 1,
+          'an unanchored formal result remains news when its review id was already collected');
+        assert.match(JSON.stringify(f.sent.at(-1)), /review:10/);
+        assert.match(JSON.stringify(f.sent.at(-1)), new RegExp(state));
+
+        const renewed = (await runtime.store.get(tracked.id))?.automationState?.await?.baseline;
+        assert.ok(renewed && 'headSha' in renewed);
+        assert.equal(renewed.review?.decisionCursor, 10);
+        assert.equal(renewed.review?.verdicts?.['10']?.state, state);
+        await runtime.stop();
+        runtime = new TypedWaitRuntime(f.options);
+        await runtime.poll('pr');
+        assert.equal(f.sent.length, timing === 'ci-renewal' ? 2 : 1,
+          'renewal and restart do not replay the same unanchored result');
+      } finally { await runtime.stop(); }
+    });
+  }
+}
+
+for (const state of ['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED'] as const) {
+  for (const timing of ['registration', 'ci-renewal'] as const) {
+    test(`a result-only wait reports same-id PENDING → ${state} after ${timing}`, async () => {
+      const f = fixture();
+      const createdAt = '2026-10-09T00:00:00.000Z';
+      const trigger = cloudTrigger(createdAt);
+      const pending = { id: 10, author: 'chatgpt-codex-connector[bot]', state: 'PENDING',
+        commitId: f.snapshot().headSha };
+      f.setSnapshot({ ...f.snapshot(), comments: [trigger],
+        reviews: timing === 'registration' ? [pending] : [] });
+      let runtime = new TypedWaitRuntime(f.options);
+      try {
+        const tracked = await runtime.registerPr({ ...input, when: [
+          { kind: 'pr_review_result_available', triggerCommentId: trigger.id },
+          ...(timing === 'ci-renewal' ? [{ kind: 'pr_ci_terminal' as const }] : []),
+        ] }, f.caller);
+        if (timing === 'ci-renewal') {
+          f.setSnapshot({ ...f.snapshot(), ci: 'pass', reviews: [pending] });
+          await runtime.poll('pr');
+          assert.equal(f.sent.length, 1, 'CI renewal consumes the PENDING id without treating it as a result');
+          assert.doesNotMatch(JSON.stringify(f.sent[0]), /review:10/);
+        }
+
+        f.setSnapshot({ ...f.snapshot(), reviews: [{ ...pending, state,
+          submittedAt: '2026-10-09T00:00:01.000Z' }] });
+        await runtime.poll('pr');
+        assert.equal(f.sent.length, timing === 'ci-renewal' ? 2 : 1,
+          'a correlated cloud result remains news when its review id was already collected');
+        assert.match(JSON.stringify(f.sent.at(-1)), /review:10/);
+        assert.match(JSON.stringify(f.sent.at(-1)), new RegExp(state));
+
+        const renewed = (await runtime.store.get(tracked.id))?.automationState?.await?.baseline;
+        assert.ok(renewed && 'headSha' in renewed);
+        assert.equal(renewed.review?.decisionCursor, 10);
+        await runtime.stop();
+        runtime = new TypedWaitRuntime(f.options);
+        await runtime.poll('pr');
+        assert.equal(f.sent.length, timing === 'ci-renewal' ? 2 : 1,
+          'renewal and restart do not replay the same cloud result');
+      } finally { await runtime.stop(); }
+    });
+  }
+}
+
+test('a correlated new-id COMMENTED cloud result remains a one-shot positive control', async () => {
+  const f = fixture();
+  const trigger = cloudTrigger('2026-10-09T00:00:00.000Z');
+  f.setSnapshot({ ...f.snapshot(), comments: [trigger] });
+  const runtime = new TypedWaitRuntime(f.options);
+  try {
+    await runtime.registerPr({ ...input,
+      when: [{ kind: 'pr_review_result_available', triggerCommentId: trigger.id }] }, f.caller);
+    f.setSnapshot({ ...f.snapshot(), reviews: [{ id: 10, author: 'chatgpt-codex-connector[bot]', state: 'COMMENTED',
+      commitId: f.snapshot().headSha, submittedAt: '2026-10-09T00:00:01.000Z' }] });
+    await runtime.poll('pr');
+    assert.equal(f.sent.length, 1);
+    assert.match(JSON.stringify(f.sent[0]), /review:10/);
+    await runtime.poll('pr');
+    assert.equal(f.sent.length, 1);
+  } finally { await runtime.stop(); }
+});
+
+for (const state of ['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED'] as const) {
+  test(`a stale PENDING snapshot cannot replay an already delivered ${state} cloud result`, async () => {
+    const f = fixture();
+    const trigger = cloudTrigger('2026-10-09T00:00:00.000Z');
+    f.setSnapshot({ ...f.snapshot(), comments: [trigger] });
+    let runtime = new TypedWaitRuntime(f.options);
+    try {
+      const tracked = await runtime.registerPr({ ...input,
+        when: [{ kind: 'pr_review_result_available', triggerCommentId: trigger.id }] }, f.caller);
+      const submitted = { id: 10, author: 'chatgpt-codex-connector[bot]', state,
+        commitId: f.snapshot().headSha, submittedAt: '2026-10-09T00:00:01.000Z' };
+      f.setSnapshot({ ...f.snapshot(), reviews: [submitted] });
+      await runtime.poll('pr');
+      assert.equal(f.sent.length, 1);
+
+      f.setSnapshot({ ...f.snapshot(), reviews: [{ ...submitted, state: 'PENDING', submittedAt: undefined }] });
+      await runtime.poll('pr');
+      assert.equal(f.sent.length, 1, 'an older PENDING representation is not a new result');
+      const afterRegression = await runtime.store.get(tracked.id);
+      assert.equal(afterRegression?.automationState?.review?.observedReviews?.['10'], state,
+        'the durable per-review frontier does not regress');
+
+      await runtime.stop();
+      runtime = new TypedWaitRuntime(f.options);
+      f.setSnapshot({ ...f.snapshot(), reviews: [submitted] });
+      await runtime.poll('pr');
+      assert.equal(f.sent.length, 1, 'restoring the same submitted snapshot after restart does not replay it');
+    } finally { await runtime.stop(); }
+  });
+}
+
+for (const correlated of [false, true] as const) {
+  test(`a consumed verdict repairs a regressed collector without replaying the ${correlated ? 'correlated' : 'unanchored'} result`, async () => {
+    const f = fixture();
+    const trigger = cloudTrigger('2026-10-09T00:00:00.000Z');
+    if (correlated) f.setSnapshot({ ...f.snapshot(), comments: [trigger] });
+    const runtime = new TypedWaitRuntime(f.options);
+    try {
+      const tracked = await runtime.registerPr({ ...input, when: [{
+        kind: 'pr_review_result_available',
+        ...(correlated ? { triggerCommentId: trigger.id } : {}),
+      }] }, f.caller);
+      const submitted = { id: 10, author: correlated ? 'chatgpt-codex-connector[bot]' : 'maintainer',
+        state: 'APPROVED' as const, commitId: f.snapshot().headSha,
+        submittedAt: '2026-10-09T00:00:01.000Z' };
+      f.setSnapshot({ ...f.snapshot(), reviews: [submitted] });
+      await runtime.poll('pr');
+      assert.equal(f.sent.length, 1);
+
+      const current = await runtime.store.get(tracked.id);
+      assert.ok(current?.automationState?.review);
+      await runtime.store.patchAutomationState(tracked.id, { review: {
+        ...current.automationState.review,
+        observedReviews: { ...current.automationState.review.observedReviews, '10': 'PENDING' },
+      } });
+      await runtime.poll('pr');
+      assert.equal(f.sent.length, 1, 'the baseline verdict proves this is collector repair, not a new result');
+      assert.equal((await runtime.store.get(tracked.id))?.automationState?.review?.observedReviews?.['10'], 'APPROVED',
+        'the collector quietly repairs its per-id state');
+    } finally { await runtime.stop(); }
+  });
+}
+
+test('a legacy consumed COMMENTED result repairs a regressed collector without replaying', async () => {
+  const f = fixture();
+  const trigger = cloudTrigger('2026-10-09T00:00:00.000Z');
+  f.setSnapshot({ ...f.snapshot(), comments: [trigger] });
+  const runtime = new TypedWaitRuntime(f.options);
+  try {
+    const tracked = await runtime.registerPr({ ...input,
+      when: [{ kind: 'pr_review_result_available', triggerCommentId: trigger.id }] }, f.caller);
+    const submitted = { id: 10, author: 'chatgpt-codex-connector[bot]', state: 'COMMENTED' as const,
+      commitId: f.snapshot().headSha, submittedAt: '2026-10-09T00:00:01.000Z' };
+    f.setSnapshot({ ...f.snapshot(), reviews: [submitted] });
+    await runtime.poll('pr');
+    assert.equal(f.sent.length, 1);
+
+    const current = await runtime.store.get(tracked.id);
+    const active = current?.automationState?.await as GitHubPrAwaitStateV1 | undefined;
+    assert.ok(current?.automationState?.review && active && 'headSha' in active.baseline);
+    const { submittedReviewStates: _legacyMissing, ...legacyReview } = active.baseline.review ?? {
+      inlineCommentCursor: 0, conversationCommentCursor: 0, decisionCursor: 0,
+    };
+    await runtime.store.patchAutomationState(tracked.id, {
+      review: { ...current.automationState.review,
+        observedReviews: { ...current.automationState.review.observedReviews, '10': 'PENDING' } },
+      await: { ...active, baseline: { ...active.baseline, review: legacyReview } },
+    });
+    await runtime.poll('pr');
+    assert.equal(f.sent.length, 1, 'an alpha.25-consumed COMMENTED result is historical activity');
+    const repaired = await runtime.store.get(tracked.id);
+    assert.equal(repaired?.automationState?.review?.observedReviews?.['10'], 'COMMENTED');
+    const repairedBaseline = repaired?.automationState?.await?.baseline;
+    assert.ok(repairedBaseline && 'headSha' in repairedBaseline);
+    assert.equal(repairedBaseline.review?.submittedReviewStates?.['10']?.state, 'COMMENTED');
+  } finally { await runtime.stop(); }
+});
+
+for (const state of ['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED'] as const) {
+  test(`superseding registration preserves a historical ${state} across a stale PENDING baseline`, async () => {
+    const f = fixture();
+    const submitted = { id: 10, author: 'maintainer', state, commitId: f.snapshot().headSha,
+      submittedAt: '2026-10-09T00:00:01.000Z' };
+    f.setSnapshot({ ...f.snapshot(), reviews: [submitted] });
+    const runtime = new TypedWaitRuntime(f.options);
+    try {
+      const tracked = await runtime.registerPr({ ...input,
+        when: [{ kind: 'pr_review_result_available' }] }, f.caller);
+      f.setSnapshot({ ...f.snapshot(), reviews: [{ ...submitted, state: 'PENDING', submittedAt: undefined }] });
+      const superseded = await runtime.registerPr({ ...input, registrationId: `supersede-${state}`,
+        when: [{ kind: 'pr_review_result_available' }] }, f.caller);
+      assert.equal(superseded.id, tracked.id);
+      assert.equal(superseded.automationState?.review?.observedReviews?.['10'], state,
+        'registration cannot regress the durable submitted frontier');
+      const baseline = superseded.automationState?.await?.baseline;
+      assert.ok(baseline && 'headSha' in baseline);
+      assert.equal(baseline.review?.submittedReviewStates?.['10']?.state, state,
+        'the replacement generation retains the consumed submitted state');
+
+      f.setSnapshot({ ...f.snapshot(), reviews: [submitted] });
+      await runtime.poll('pr');
+      assert.equal(f.sent.length, 0, 'restoring a historical verdict after registration is not new activity');
+    } finally { await runtime.stop(); }
+  });
+}
+
+for (const state of ['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED'] as const) {
+  test(`completed registration preserves a historical ${state} across a stale PENDING baseline`, async () => {
+    const f = fixture();
+    const trigger = cloudTrigger('2026-10-09T00:00:00.000Z');
+    f.setSnapshot({ ...f.snapshot(), comments: [trigger] });
+    const runtime = new TypedWaitRuntime(f.options);
+    try {
+      const tracked = await runtime.registerPr({ ...input, autoRenew: false,
+        when: [{ kind: 'pr_review_result_available', triggerCommentId: trigger.id }] }, f.caller);
+      const submitted = { id: 10, author: 'chatgpt-codex-connector[bot]', state,
+        commitId: f.snapshot().headSha, submittedAt: '2026-10-09T00:00:01.000Z' };
+      f.setSnapshot({ ...f.snapshot(), reviews: [submitted] });
+      await runtime.poll('pr');
+      assert.equal(f.sent.length, 1);
+      assert.equal((await runtime.store.get(tracked.id))?.automationState?.await, undefined,
+        'the first generation completed before re-registration');
+
+      f.setSnapshot({ ...f.snapshot(), reviews: [{ ...submitted, state: 'PENDING', submittedAt: undefined }] });
+      const replaced = await runtime.registerPr({ ...input, registrationId: `completed-${state}`,
+        when: [{ kind: 'pr_review_result_available', triggerCommentId: trigger.id }] }, f.caller);
+      assert.equal(replaced.automationState?.review?.observedReviews?.['10'], state,
+        'registration keeps the completed generation collector frontier');
+      const baseline = replaced.automationState?.await?.baseline;
+      assert.ok(baseline && 'headSha' in baseline);
+      assert.equal(baseline.review?.submittedReviewStates?.['10']?.state, state,
+        'registration keeps the completed generation submitted frontier');
+
+      f.setSnapshot({ ...f.snapshot(), reviews: [submitted] });
+      await runtime.poll('pr');
+      assert.equal(f.sent.length, 1, 'restoring completed historical activity does not replay it');
+    } finally { await runtime.stop(); }
+  });
+}
+
+test('an ordinary decision wait keeps a same-id PENDING → COMMENTED submission quiet', async () => {
+  const f = fixture();
+  const pending = { id: 10, author: 'self', state: 'PENDING', commitId: f.snapshot().headSha };
+  f.setSnapshot({ ...f.snapshot(), reviews: [pending] });
+  const runtime = new TypedWaitRuntime(f.options);
+  try {
+    const tracked = await runtime.registerPr({ ...input,
+      when: [{ kind: 'pr_review_decision_changed' }] }, f.caller);
+    f.setSnapshot({ ...f.snapshot(), reviews: [{ ...pending, state: 'COMMENTED' }] });
+    await runtime.poll('pr');
+    assert.equal(f.sent.length, 0, 'COMMENTED is a cloud result only under explicit trigger correlation');
+    assert.equal((await runtime.store.get(tracked.id))?.automationState?.review?.observedReviews?.['10'], 'COMMENTED');
+    await runtime.poll('pr');
+    assert.equal(f.sent.length, 0);
+  } finally { await runtime.stop(); }
+});
+
+for (const timing of ['registration', 'ci-renewal'] as const) {
+  test(`a PENDING review submitted and dismissed under the same id reports after ${timing}`, async () => {
+    const f = fixture();
+    const pending = { id: 10, author: 'maintainer', state: 'PENDING', commitId: f.snapshot().headSha };
+    f.setSnapshot({ ...f.snapshot(), reviews: timing === 'registration' ? [pending] : [] });
+    let runtime = new TypedWaitRuntime(f.options);
+    try {
+      const tracked = await runtime.registerPr({ ...input, when: [
+        { kind: 'pr_review_decision_changed' },
+        ...(timing === 'ci-renewal' ? [{ kind: 'pr_ci_terminal' as const }] : []),
+      ] }, f.caller);
+      if (timing === 'ci-renewal') {
+        f.setSnapshot({ ...f.snapshot(), ci: 'pass', reviews: [pending] });
+        await runtime.poll('pr');
+        assert.equal(f.sent.length, 1);
+        assert.doesNotMatch(JSON.stringify(f.sent[0]), /review:10/);
+      }
+
+      f.setSnapshot({ ...f.snapshot(), reviews: [{ ...pending, state: 'DISMISSED' }] });
+      await runtime.poll('pr');
+      assert.equal(f.sent.length, timing === 'ci-renewal' ? 2 : 1,
+        'a collected PENDING id cannot hide a later dismissal');
+      assert.match(JSON.stringify(f.sent.at(-1)), /review:10/);
+      assert.match(JSON.stringify(f.sent.at(-1)), /DISMISSED/);
+      const renewed = (await runtime.store.get(tracked.id))?.automationState?.await?.baseline;
+      assert.ok(renewed && 'headSha' in renewed);
+      assert.equal(renewed.review?.decisionCursor, 10);
+      assert.equal(renewed.review?.verdicts?.['10']?.state, 'DISMISSED');
+
+      await runtime.stop();
+      runtime = new TypedWaitRuntime(f.options);
+      await runtime.poll('pr');
+      assert.equal(f.sent.length, timing === 'ci-renewal' ? 2 : 1,
+        'the same dismissal is not replayed after renewal and restart');
+    } finally { await runtime.stop(); }
+  });
+}
+
+test('a collected older-HEAD PENDING review still reports its same-id dismissal once', async () => {
+  const f = fixture();
+  const oldHead = 'b'.repeat(40);
+  const pending = { id: 10, author: 'maintainer', state: 'PENDING', commitId: oldHead };
+  let runtime = new TypedWaitRuntime(f.options);
+  try {
+    await runtime.registerPr({ ...input, when: [{ kind: 'pr_review_decision_changed' }] }, f.caller);
+    f.setSnapshot({ ...f.snapshot(), reviews: [pending] });
+    await runtime.poll('pr');
+    assert.equal(f.sent.length, 0);
+
+    f.setSnapshot({ ...f.snapshot(), reviews: [{ ...pending, state: 'DISMISSED' }] });
+    await runtime.poll('pr');
+    assert.equal(f.sent.length, 1);
+    assert.match(JSON.stringify(f.sent[0]), /review:10/);
+    assert.match(JSON.stringify(f.sent[0]), /PENDING → DISMISSED/);
+
+    await runtime.stop();
+    runtime = new TypedWaitRuntime(f.options);
+    await runtime.poll('pr');
+    assert.equal(f.sent.length, 1, 'renewal and restart do not replay the older-HEAD dismissal');
+  } finally { await runtime.stop(); }
+});
+
 for (const authors of [['alice', 'bot[bot]'], ['bot[bot]', 'alice'], ['alice', 'bob', 'bot[bot]']]) {
   test(`mixed review authors are filtered independently before the poll is consumed (${authors.join(',')})`, async () => {
     const f = fixture();
