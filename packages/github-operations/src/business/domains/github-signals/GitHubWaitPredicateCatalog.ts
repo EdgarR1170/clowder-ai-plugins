@@ -164,7 +164,12 @@ export interface GitHubWaitFacts {
     readonly decision?: string;
     readonly reviewer?: string;
     /** Current-HEAD review objects retain their own source for actor policy. */
-    readonly decisions?: readonly { readonly id: number; readonly state: string; readonly author: string }[];
+    readonly decisions?: readonly {
+      readonly id: number;
+      readonly state: string;
+      readonly author: string;
+      readonly submittedAt?: string;
+    }[];
     /**
      * Raw review states can change without changing their GitHub id. This observation-local delta
      * comes from the durable collector frontier, not the decision cursor, so a PENDING review can
@@ -404,13 +409,16 @@ export function matchGitHubWaitPredicates(
         const submittedSameIdResult = resultReviewId !== undefined &&
           before?.submittedReviewStates !== undefined &&
           before.submittedReviewStates[resultReviewId] === undefined &&
+          before.verdicts?.[resultReviewId] === undefined &&
           after?.stateChanges?.some(change =>
           change.id === Number(resultReviewId) && change.previousState === 'PENDING' && change.currentHead &&
           change.state === after.decision) === true;
         const resultFrontierAdvanced =
           before !== undefined &&
           after !== undefined &&
-          (after.decisionCursor > before.decisionCursor ||
+          ((resultReviewId !== undefined && Number(resultReviewId) > before.decisionCursor &&
+              before.verdicts?.[resultReviewId] === undefined &&
+              before.submittedReviewStates?.[resultReviewId] === undefined) ||
             submittedSameIdResult ||
             (after.resultConversationCommentCursor !== undefined &&
               after.resultConversationCommentCursor > before.conversationCommentCursor));
@@ -442,7 +450,9 @@ export function matchGitHubWaitPredicates(
         if (before && after && frontier !== undefined && frontier > before.decisionCursor) {
           if (after.decisions) {
             for (const review of [...after.decisions].sort((a, b) => a.id - b.id)) {
-              if (review.id <= before.decisionCursor || review.id > frontier) continue;
+              if (review.id <= before.decisionCursor || review.id > frontier ||
+                  before.verdicts?.[String(review.id)] !== undefined ||
+                  before.submittedReviewStates?.[String(review.id)] !== undefined) continue;
               matches.push({ kind: predicate.kind,
                 delta: `review ${before.decision ?? 'pending'} → ${review.state} (${review.author})`,
                 sourceRef: `review:${review.id}` });

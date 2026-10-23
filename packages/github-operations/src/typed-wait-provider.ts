@@ -118,16 +118,10 @@ export function waitObservation(task: TaskItem, snapshot: GitHubSnapshot, now: n
     : undefined;
   const trigger = snapshot.comments.find(row => row.commentType === 'conversation' && row.id === before?.resultTriggerCommentId);
   const requestedAt = Date.parse(trigger?.createdAt ?? '');
-  // A collected PENDING id still has an unresolved submitted state, so its disappearance makes the
-  // review observation incomplete. Already-consumed submitted ids are durable history: GitHub need
-  // not return every one of them forever, and they must not block a later correlated review request.
-  // Legacy baselines have no submitted frontier, so retain the conservative all-known-ids check
-  // until their first complete observation is quietly adopted.
-  const knownReviewIds = before?.submittedReviewStates === undefined
-    ? [...Object.keys(seen), ...Object.keys(before?.verdicts ?? {})]
-    : Object.entries(seen)
-      .filter(([id, state]) => state === 'PENDING' || before.submittedReviewStates?.[id] === undefined)
-      .map(([id]) => id);
+  // Only unresolved collected ids require a row. Either durable map proves consumption, including
+  // legacy verdicts with no submitted frontier and collectors regressed to PENDING.
+  const knownReviewIds = Object.keys(seen).filter(id => before?.verdicts?.[id] === undefined &&
+    before?.submittedReviewStates?.[id] === undefined);
   const completeReviews = knownReviewIds.every(id => reviews.some(row => String(row.id) === id));
   const classification = completeReviews && trigger && Number.isFinite(requestedAt) ? classifyExternalCloudReview({
     currentHeadSha: snapshot.headSha,
@@ -136,11 +130,13 @@ export function waitObservation(task: TaskItem, snapshot: GitHubSnapshot, now: n
     now, timeoutMs: 30 * 60_000,
   }) : undefined;
   const evidence = classification?.evidence;
-  const newReviews = currentReviews.filter(row => row.id > (before?.decisionCursor ?? 0));
+  const newReviews = currentReviews.filter(row => row.id > (before?.decisionCursor ?? 0) &&
+    before?.verdicts?.[String(row.id)] === undefined && before?.submittedReviewStates?.[String(row.id)] === undefined);
   const submittedSameIdReviewIds = stateChanges
     .filter(change => change.previousState === 'PENDING' && change.currentHead &&
       isGitHubReviewDecisionState(change.state) &&
       before?.submittedReviewStates !== undefined &&
+      before.verdicts?.[String(change.id)] === undefined &&
       before.submittedReviewStates[String(change.id)] === undefined)
     .map(change => change.id);
   const newDecisionReviewIds = [...new Set([...newReviews.map(row => row.id), ...submittedSameIdReviewIds])];

@@ -11,7 +11,7 @@ import type {
 } from '../../model/index.js';
 import type { WaitRenewalInstruction } from '../ball-custody/wait-state-machine.js';
 import {
-  isGitHubReviewDecisionState, mergeReviewVerdicts, mergeSubmittedReviewStates,
+  anchorGitHubReviewVerdicts, latestGitHubReviewDecision, isGitHubReviewDecisionState, mergeReviewVerdicts, mergeSubmittedReviewStates,
 } from './GitHubReviewVerdicts.js';
 import type { GitHubWaitFacts } from './GitHubWaitPredicateCatalog.js';
 
@@ -44,10 +44,31 @@ function maxCursor(previous: number, ...observed: (number | undefined)[]): numbe
 const UNOBSERVED_MERGE_STATE = 'UNKNOWN';
 const unobservedCiFingerprint = (headSha: string) => `${headSha}:unobserved`;
 
-function latestReviewDecision(facts: GitHubWaitFacts): string | undefined {
-  return [...(facts.review?.decisions ?? [])]
-    .filter(review => isGitHubReviewDecisionState(review.state))
-    .sort((a, b) => a.id - b.id).at(-1)?.state;
+function renewedReviewVerdicts(previous: GitHubPrWaitBaseline, facts: GitHubWaitFacts, headSha: string): GitHubReviewVerdicts | undefined {
+  // A missing row is not a revocation. Keep the consumed evidence and replace it only with an
+  // observed state change. Older records lack HEAD metadata; anchor those to their installed HEAD.
+  const retained = anchorGitHubReviewVerdicts(previous.review?.verdicts, previous.headSha);
+  const observed = { ...facts.review?.verdicts };
+  for (const review of facts.review?.decisions ?? []) {
+    if (isGitHubReviewDecisionState(review.state)) observed[String(review.id)] = {
+      ...observed[String(review.id)], state: review.state, author: review.author,
+      commitId: headSha, ...(review.submittedAt ? { submittedAt: review.submittedAt } : {}),
+    };
+  }
+  return mergeReviewVerdicts(retained,
+    facts.review?.verdicts !== undefined || Object.keys(observed).length > 0 ? observed : undefined);
+}
+
+function sameReviewStateMap(
+  left: Readonly<Record<string, { state: string; author?: string; commitId?: string; submittedAt?: string }>> | undefined,
+  right: Readonly<Record<string, { state: string; author?: string; commitId?: string; submittedAt?: string }>> | undefined,
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  const leftEntries = Object.entries(left);
+  const rightEntries = Object.entries(right);
+  if (leftEntries.length !== rightEntries.length) return false;
+  return leftEntries.every(([id, value]) => value.state === right[id]?.state && value.author === right[id]?.author &&
+    value.commitId === right[id]?.commitId && value.submittedAt === right[id]?.submittedAt);
 }
 
 export function renewPrWaitBaseline(
@@ -58,7 +79,10 @@ export function renewPrWaitBaseline(
 ): GitHubPrWaitBaseline {
   const headSha = facts.headSha ?? collector.ci?.headSha ?? previous.headSha;
   const headChanged = headSha !== previous.headSha;
-  const observedDecision = latestReviewDecision(facts);
+  // Select and persist from the SAME anchored evidence; temporary anchoring would be lost after a
+  // HEAD-follow generation, allowing the next renewal to reinterpret old verdicts on the new HEAD.
+  const verdicts = renewedReviewVerdicts(previous, facts, headSha);
+  const observedDecision = latestGitHubReviewDecision(verdicts, headSha);
   const previousReview = previous.review;
   const previousReviewWithoutDecision = previousReview && (() => {
     const { decision: _revokedOrReplacedDecision, ...rest } = previousReview;
@@ -84,11 +108,10 @@ export function renewPrWaitBaseline(
           collector.review?.lastDecisionCursor,
           facts.review?.decisionCursor,
         ),
-        // The observation is a complete provider read. Rebuild the decision from its formal review
-        // list so COMMENTED cannot replace it and a dismissal cannot leave a revoked value behind.
+        // Merge submitted evidence across pages; only an explicit dismissal revokes a verdict.
         ...(observedDecision ? { decision: observedDecision } : {}),
         ...(facts.review?.threads && !headChanged ? { threads: facts.review.threads } : {}),
-        ...renewVerdicts(previousReview.verdicts, facts),
+        ...(verdicts !== undefined ? { verdicts } : {}),
         ...renewSubmittedReviewStates(previousReview.submittedReviewStates, facts),
       }
     : undefined;
@@ -110,15 +133,6 @@ export function renewPrWaitBaseline(
     ...(ci ? { ci } : {}),
     ...(conflict ? { conflict } : {}),
   };
-}
-
-/** #1392: verdicts are not head-scoped either; a dismissal is reported whichever HEAD it happens on. */
-function renewVerdicts(
-  seen: GitHubReviewVerdicts | undefined,
-  facts: GitHubWaitFacts,
-): { readonly verdicts?: GitHubReviewVerdicts } {
-  const verdicts = mergeReviewVerdicts(seen, facts.review?.verdicts);
-  return verdicts ? { verdicts } : {};
 }
 
 function renewSubmittedReviewStates(
@@ -191,11 +205,14 @@ export function followPushedHead(
 export function adoptReviewVerdicts(active: AwaitStateV1, facts: GitHubWaitFacts): GitHubPrWaitBaseline | null {
   const baseline = active.baseline;
   if (!('headSha' in baseline) || !baseline.review || !facts.review) return null;
-  const verdicts = baseline.review.verdicts === undefined ? facts.review.verdicts : undefined;
-  const submittedReviewStates = baseline.review.submittedReviewStates === undefined
-    ? facts.review.submittedReviewStates
-    : undefined;
-  if (verdicts === undefined && submittedReviewStates === undefined) return null;
+  const verdicts = mergeReviewVerdicts(baseline.review.verdicts, facts.review.verdicts);
+  const observedSubmittedReviewStates = facts.review.submittedReviewStates;
+  const submittedReviewStates = baseline.review.submittedReviewStates === undefined &&
+      Object.keys(observedSubmittedReviewStates ?? {}).length === 0
+    ? undefined
+    : mergeSubmittedReviewStates(baseline.review.submittedReviewStates, observedSubmittedReviewStates);
+  if (sameReviewStateMap(baseline.review.verdicts, verdicts) &&
+      sameReviewStateMap(baseline.review.submittedReviewStates, submittedReviewStates)) return null;
   return { ...baseline, review: {
     ...baseline.review,
     ...(verdicts !== undefined ? { verdicts } : {}),
