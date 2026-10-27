@@ -92,8 +92,8 @@ interface Options {
 export function createCollectivePublicNativeActions(options: Options): Readonly<Record<string, PluginActionHandler>> {
   const refs = options.references,
     connector = options.connector;
-  const requireSource = async (action: PluginActionContext, method: string) => {
-    const resolved = await options.sourceCaller.resolveNative(action, method);
+  const requireSource = async (action: PluginActionContext) => {
+    const resolved = await options.sourceCaller.resolveNative(action);
     const profile = async () => {
       const route = await connector.getHostRoute(resolved.source.connectionId);
       const connection = await connector.getProjection(resolved.source.connectionId);
@@ -187,7 +187,6 @@ export function createCollectivePublicNativeActions(options: Options): Readonly<
   };
   const handler =
     <T>(
-      method: string,
       schema: z.ZodType<T, z.ZodTypeDef, unknown>,
       consume: (binding: Binding, input: T) => Promise<unknown>,
     ): PluginActionHandler =>
@@ -199,14 +198,13 @@ export function createCollectivePublicNativeActions(options: Options): Readonly<
         throw Object.assign(parsed.error, {
           code: 'INVALID_COLLECTIVE_REQUEST',
         });
-      const binding = await requireSource(action, method);
+      const binding = await requireSource(action);
       const result = await consume(binding, parsed.data);
       await binding.revalidate();
       return result;
     };
   return Object.freeze({
     'collective.project.context': handler(
-      'collective.project.context',
       projectSourceContextInputSchema,
       async (binding, input) => {
         refs.verifyRef(binding.identity, input.contextRef, 'context', binding.refScope);
@@ -214,13 +212,12 @@ export function createCollectivePublicNativeActions(options: Options): Readonly<
         return connector.readProjectSource(binding.source);
       },
     ),
-    'collective.material.read': handler('collective.material.read', materialReadInputSchema, async (binding, input) => {
+    'collective.material.read': handler(materialReadInputSchema, async (binding, input) => {
       refs.verifyRef(binding.identity, input.contextRef, 'context', binding.refScope);
       if (!connector.readProjectSource) throw new Error('Project source reader is unavailable');
       return connector.readProjectSource(binding.source, input.materialId);
     }),
     'collective.material.suggest': handler(
-      'collective.material.suggest',
       materialSuggestInputSchema,
       async (binding, input) => {
         refs.verifyRef(binding.identity, input.contextRef, 'context', binding.refScope);
@@ -230,7 +227,6 @@ export function createCollectivePublicNativeActions(options: Options): Readonly<
       },
     ),
     'collective.work.suggest-time': handler(
-      'collective.work.suggest-time',
       publicTimeSuggestInputSchema,
       async (binding, input) => {
         refs.verifyRef(binding.identity, input.contextRef, 'context', binding.refScope);
@@ -241,7 +237,6 @@ export function createCollectivePublicNativeActions(options: Options): Readonly<
       },
     ),
     'collective.artifact.command': handler(
-      'collective.artifact.command',
       collectiveArtifactCallbackCommandSchema,
       async (binding, input) => {
         refs.verifyRef(binding.identity, input.contextRef, 'context', binding.refScope);
@@ -249,16 +244,14 @@ export function createCollectivePublicNativeActions(options: Options): Readonly<
       },
     ),
     'collective.work.suggest-project': handler(
-      'collective.work.suggest-project',
       collectivePublicNativeTools.find((tool) => tool.method === 'collective.work.suggest-project')!.schema,
       async (binding, input) => {
         refs.verifyRef(binding.identity, input.contextRef, 'context', binding.refScope);
         return suggestProjectWorkFromSource(connector, refs, binding.identity, binding, input, binding.revalidate);
       },
     ),
-    'collective.context.current': handler('collective.context.current', currentSchema, (binding) => current(binding)),
+    'collective.context.current': handler(currentSchema, (binding) => current(binding)),
     'collective.context.read': handler(
-      'collective.context.read',
       collectiveContextReadSchema,
       async (binding, input) => {
         refs.verifyRef(binding.identity, input.contextRef, 'context', binding.refScope);
@@ -269,7 +262,6 @@ export function createCollectivePublicNativeActions(options: Options): Readonly<
       },
     ),
     'collective.sticker.prepare': handler(
-      'collective.sticker.prepare',
       collectiveStickerPrepareSchema,
       async (binding, input) => {
         refs.verifyRef(binding.identity, input.contextRef, 'context', binding.refScope);
@@ -283,7 +275,6 @@ export function createCollectivePublicNativeActions(options: Options): Readonly<
       },
     ),
     'collective.participation.set-interest': handler(
-      'collective.participation.set-interest',
       interestSchema,
       async (binding, input) => {
         refs.verifyRef(binding.identity, input.contextRef, 'context', binding.refScope);
@@ -308,7 +299,7 @@ export function createCollectivePublicNativeActions(options: Options): Readonly<
         };
       },
     ),
-    'collective.work.propose': handler('collective.work.propose', proposeSchema, async (binding, input) => {
+    'collective.work.propose': handler(proposeSchema, async (binding, input) => {
       refs.verifyRef(binding.identity, input.contextRef, 'context', binding.refScope);
       await binding.revalidate();
       // Original public proposal: Service decides the matter; this grants no Task/execution authority.
@@ -319,7 +310,6 @@ export function createCollectivePublicNativeActions(options: Options): Readonly<
       });
     }),
     'collective.work.accept': handler(
-      'collective.work.accept',
       acceptSchema,
       async (binding, { contextRef, ...input }) => {
         refs.verifyRef(binding.identity, contextRef, 'context', binding.refScope);
@@ -339,7 +329,6 @@ export function createCollectivePublicNativeActions(options: Options): Readonly<
       },
     ),
     'collective.work.continue': handler(
-      'collective.work.continue',
       continueSchema,
       async (binding, { contextRef, ...input }) => {
         refs.verifyRef(binding.identity, contextRef, 'context', binding.refScope);
@@ -348,7 +337,6 @@ export function createCollectivePublicNativeActions(options: Options): Readonly<
       },
     ),
     'collective.reply.submit': handler(
-      'collective.reply.submit',
       collectiveReplySubmitSchema,
       async (binding, input) => {
         const operation = await connector.prepareReply(binding.source, binding.sourceRef, 'request');

@@ -1,5 +1,5 @@
 pluginId: official.companion.personal-chrome
-version: 0.1.0-alpha.8
+version: 0.1.0-alpha.9
 contractVersion: 0.1.0
 name: Personal Chrome Companion
 icon:
@@ -67,9 +67,6 @@ features:
     contributions:
       - type: cloud-conversation-host
         id: personal-chrome-chatgpt-host
-    capabilities:
-
-      - cloud.conversation.host
 runtime:
   transport: builtin
   entrypoint: dist/plugin-entrypoint.js

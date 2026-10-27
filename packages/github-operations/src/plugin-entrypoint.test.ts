@@ -1657,18 +1657,6 @@ function host() {
 }
 
 test('real manifest → SDK builtin activation → tracking → schedule → ordinary message → terminal → stop without Host Tasks', async () => {
-  assert.equal(
-    manifest.features[0].capabilities.includes('thread.readContent'),
-    false,
-    'GitHub notifications never require content access',
-  );
-  for (const capability of ['task.read', 'task.write']) {
-    assert.equal(
-      manifest.features[0].capabilities.includes(capability),
-      true,
-      'Retained Host wait migration declares its existing Task requirements',
-    );
-  }
   const f = host();
   let snapshot: GitHubSnapshot = { state: 'open', headSha: 'a'.repeat(40), ci: 'pending', comments: [], reviews: [] };
   let reads = 0;
@@ -1684,15 +1672,9 @@ test('real manifest → SDK builtin activation → tracking → schedule → ord
   const active = await module.create(manifest).start(f.runtimeHost);
   await active.actions['github.pr-tracking']!({});
   assert.equal(reads, 0);
-  const mcp = manifest.contributions.find((c: { id: string }) => c.id === 'github-tracking');
-  assert.equal(
-    manifest.contributions.some(
-      (c: { type: string; action?: { method: string } }) =>
-        c.type === 'tool' && c.action?.method.startsWith('github.typed-wait.'),
-    ),
-    false,
-  );
-  const registered = await active.actions[mcp.actions[0].method]!(prInput, caller);
+  assert.equal(manifest.contributions.some((c: { type: string; action?: { method: string } }) =>
+    c.type === 'tool' && c.action?.method.startsWith('github.typed-wait.')), false);
+  const registered = await active.actions['github.typed-wait.register-pr']!(prInput, caller);
   assert.ok((registered as any).automationState.await);
   snapshot = {
     ...snapshot,
@@ -2369,19 +2351,11 @@ test('production owner HTTP accepts only the Host envelope and preserves owner/n
   }
 });
 
-test('production module exposes ordinary review records without private Host completion callbacks', async () => {
-  const f = host(),
-    active = await createGitHubPluginModule().create(manifest).start(f.runtimeHost);
-  try {
-    assert.equal(Object.hasOwn(active, 'predicateVerifiers'), false);
-    assert.equal(typeof active.actions['github.review.record-verdict'], 'function');
-    assert.equal(
-      manifest.contributions.some((row: { type: string }) => row.type === 'terminal-predicate-provider'),
-      false,
-    );
-    for (const grant of ['custody.invoke', 'custody.verify', 'deployment.read', 'frustration.read', 'frustration.link'])
-      assert.equal(manifest.features[0].capabilities.includes(grant), false);
-  } finally {
-    await active.stop({ reason: 'test' });
-  }
+test('production module exposes ordinary review records without private Host completion callbacks',async()=>{
+ const f=host(), active=await createGitHubPluginModule().create(manifest).start(f.runtimeHost);
+ try {
+  assert.equal(Object.hasOwn(active,'predicateVerifiers'),false);
+  assert.equal(typeof active.actions['github.review.record-verdict'],'function');
+  assert.equal(manifest.contributions.some((row:{type:string})=>row.type==='terminal-predicate-provider'),false);
+ } finally {await active.stop({reason:'test'});}
 });

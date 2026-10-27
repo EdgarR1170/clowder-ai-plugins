@@ -4,13 +4,12 @@ import { expect, it } from 'vitest';
 import { z } from 'zod';
 import { openCollectiveContextReferences } from '../../../collective-context-refs.js';
 import { createCollectivePublicNativeActions } from '../../../collective-public-native-context.js';
-import { COLLECTIVE_PUBLIC_METHODS } from '../../../public-native-methods.js';
 import { collectiveMaterialRecordSchema } from '../../contracts/types/collective-material.js';
 import { collectiveProjectSourceReadSchema } from '../../contracts/types/collective-project-source.js';
 import { publicSourceFixture } from './public-source-caller.fixture.js';
 
 it('binds live Project material and date suggestions to actual native context across the owner relay', async () => {
-  const f = await publicSourceFixture({ methods: COLLECTIVE_PUBLIC_METHODS, invocationId: 'fixture-running-turn' });
+  const f = await publicSourceFixture({ invocationId: 'fixture-running-turn' });
   try {
     const refs = await openCollectiveContextReferences(join(f.root, 'project-native-refs'), () => {});
     const actions = createCollectivePublicNativeActions({

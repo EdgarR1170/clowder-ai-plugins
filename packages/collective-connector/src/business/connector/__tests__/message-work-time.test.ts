@@ -246,7 +246,6 @@ test('current Service facts materialize the missing private receipt only after t
             pluginInstanceId: 'installed',
             moduleRef: 'plugin:official.collective-connector',
             lifecycleRevision: 8,
-            grantRevision: 3,
             ownerOperationReceiptRef: controllerReceipt,
           },
         },

@@ -186,4 +186,3 @@ export const collectivePublicNativeTools = [
     schema: collectiveReplySubmitSchema,
   },
 ] as const;
-export const COLLECTIVE_PUBLIC_METHODS = Object.freeze(collectivePublicNativeTools.map((tool) => tool.method));

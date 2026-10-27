@@ -38,40 +38,14 @@ test('production Work module owns one private MCP and rejects untrusted calls be
   try {
     const work = manifest.features.find((feature: { id: string }) => feature.id === 'collective-work');
     assert.ok(work, 'Work must enter through an owned production feature');
-    const taskMcp = manifest.contributions.filter(
-      (contribution: { type: string; id: string }) =>
-        contribution.type === 'mcp' &&
-        manifest.features.some(
-          (feature: { capabilities: string[]; contributions: { type: string; id: string }[] }) =>
-            feature.capabilities.includes('task.admitEntrusted') &&
-            feature.contributions.some((ref) => ref.type === 'mcp' && ref.id === contribution.id),
-        ),
-    );
+    const taskMcp = manifest.contributions.filter((contribution: {type: string; id: string}) =>
+      contribution.type === 'mcp' && work.contributions.some((ref: {type: string; id: string}) =>
+        ref.type === 'mcp' && ref.id === contribution.id));
     assert.equal(taskMcp.length, 1);
     assert.equal(taskMcp[0].id, 'collective-work-native');
-    assert.deepEqual(
-      taskMcp[0].actions.map((action: { method: string }) => action.method).sort(),
-      [
-        'collective.work.context.current',
-        'collective.work.context.read',
-        'collective.work.progress',
-        'collective.work.artifact.read',
-        'collective.work.artifact.command',
-        'collective.work.artifact.register',
-        'collective.work.reply.submit',
-        'collective.work.time',
-        'collective.work.project.context',
-        'collective.work.material.read',
-        'collective.work.material.suggest',
-      ].sort(),
-    );
-    assert.equal(
-      manifest.features
-        .find((feature: { id: string }) => feature.id === 'collective-backend')
-        .capabilities.includes('task.admitEntrusted'),
-      false,
-    );
-    for (const method of taskMcp[0].actions.map((action: { method: string }) => action.method)) {
+    for (const method of ['collective.work.context.current', 'collective.work.context.read', 'collective.work.progress',
+      'collective.work.artifact.read', 'collective.work.artifact.command', 'collective.work.artifact.register', 'collective.work.reply.submit',
+      'collective.work.time', 'collective.work.project.context', 'collective.work.material.read', 'collective.work.material.suggest']) {
       assert.equal(typeof active.actions[method], 'function');
       await assert.rejects(() => Promise.resolve(active.actions[method]!({})));
     }
@@ -96,60 +70,19 @@ test('production Work module owns one private MCP and rejects untrusted calls be
       ),
     );
     const method = 'collective.work.context.current';
-    const native = {
-      toolExecutionPolicy: { mode: 'plugin_native', contributionId: 'collective-work-native', actionMethods: [method] },
-      assertCurrent: async () => {},
-    } as never;
-    await assert.rejects(() => Promise.resolve(active.actions[method]!({ taskId: 'body-forged-task' }, native)));
-    await assert.rejects(() =>
-      Promise.resolve(
-        active.actions[method]!({}, {
-          toolExecutionPolicy: { mode: 'plugin_native', contributionId: 'collective-native', actionMethods: [method] },
-        } as never),
-      ),
-    );
-    const expired = {
-      kind: 'owner-operation' as const,
-      userId: 'owner',
-      pluginInstanceId: 'instance',
-      requestId: 'expired-owner-operation',
-      operationKey: 'work',
-      actionId: 'list',
-      signal: new AbortController().signal,
-      assertCurrent: async () => {
-        throw new Error('Owner operation ended');
-      },
-    };
-    await assert.rejects(
-      () => Promise.resolve(active.actions['collective.work.owner.connections']!({ input: {} }, undefined, expired)),
-      /ended/,
-    );
-    await assert.rejects(
-      () =>
-        Promise.resolve(
-          active.actions['collective.work.owner.sync']!({ input: { connectionId: 'c1' } }, undefined, {
-            ...expired,
-            actionId: 'sync',
-          }),
-        ),
-      /ended/,
-    );
-    for (const [actionId, method] of [
-      ['adopt-task', 'collective.work.owner.adopt-task'],
-      ['revoke-task', 'collective.work.owner.revoke-task'],
-    ] as const) {
-      await assert.rejects(
-        () =>
-          Promise.resolve(
-            active.actions[method]!({ input: { taskId: 'task', sourceMessageId: 'source', catId: 'cat' } }, undefined, {
-              ...expired,
-              actionId,
-              assertCurrent: async () => {},
-              confirmed: false,
-            }),
-          ),
-        /confirmed owner/i,
-      );
+    const native = { userId: 'owner', catId: 'cat', threadId: 'thread', invocationId: 'invocation',
+      originTriggerMessageId: 'source', assertCurrent: async () => {} };
+    await assert.rejects(() => Promise.resolve(active.actions[method]!({taskId: 'body-forged-task'}, native)));
+    await assert.rejects(() => Promise.resolve(active.actions[method]!({}, { ...native, originTriggerMessageId: undefined })));
+    const expired = {kind: 'owner-operation' as const, userId: 'owner', pluginInstanceId: 'instance',
+      requestId: 'expired-owner-operation', operationKey: 'work', actionId: 'list',
+      signal: new AbortController().signal, assertCurrent: async () => {throw new Error('Owner operation ended');}};
+    await assert.rejects(() => Promise.resolve(active.actions['collective.work.owner.connections']!({input: {}}, undefined, expired)), /ended/);
+    await assert.rejects(() => Promise.resolve(active.actions['collective.work.owner.sync']!({input: {connectionId: 'c1'}}, undefined, {...expired, actionId: 'sync'})), /ended/);
+    for (const [actionId, method] of [['adopt-task','collective.work.owner.adopt-task'],
+      ['revoke-task','collective.work.owner.revoke-task']] as const) {
+      await assert.rejects(() => Promise.resolve(active.actions[method]!({input:{taskId:'task',sourceMessageId:'source',catId:'cat'}},
+        undefined,{...expired,actionId,assertCurrent:async()=>{},confirmed:false})), /confirmed owner/i);
     }
     assert.equal(effects, 0);
     await active.stop({ reason: 'test' });

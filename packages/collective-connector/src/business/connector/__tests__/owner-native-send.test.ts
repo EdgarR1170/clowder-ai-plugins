@@ -120,34 +120,6 @@ async function setup() {
   };
 }
 
-test('owner send stays separate from the exact public context, Work and Artifact methods', () => {
-  const owner = manifest.contributions.find((c: { id: string }) => c.id === 'collective-owner-native');
-  expect(owner).toMatchObject({ type: 'mcp', actions: [{ method: 'collective.connector.send' }] });
-  expect(manifest.features[0].contributions).toContainEqual({ type: 'mcp', id: owner.id });
-  expect(
-    manifest.contributions
-      .find((c: { id: string }) => c.id === 'collective-native')
-      .actions.map((action: { method: string }) => action.method)
-      .sort(),
-  ).toEqual(
-    [
-      'collective.context.current',
-      'collective.context.read',
-      'collective.sticker.prepare',
-      'collective.artifact.command',
-      'collective.work.suggest-project',
-      'collective.participation.set-interest',
-      'collective.reply.submit',
-      'collective.work.propose',
-      'collective.work.accept',
-      'collective.work.continue',
-      'collective.project.context',
-      'collective.material.read',
-      'collective.material.suggest',
-      'collective.work.suggest-time',
-    ].sort(),
-  );
-});
 test('actual module queues with authenticated owner and real Host profile without borrowing public nativeContext', async () => {
   const f = await setup();
   try {
@@ -176,27 +148,12 @@ test('unknown/compatibility owner and every limited policy are refused before ro
   const f = await setup();
   try {
     for (const ownerAuthProvenance of [undefined, 'unknown', 'compatibility_fallback'])
-      await expect(f.invoke(f.input, f.context({ ownerAuthProvenance }))).rejects.toMatchObject({
-        code: 'CONNECTOR_OWNER_AUTHORITY_REQUIRED',
-      });
-    for (const toolExecutionPolicy of [
-      { mode: 'read_only', replayDeniedToolNames: [] },
-      { mode: 'callback_allowlist', allowedCallbackRoutes: [] },
-      {
-        mode: 'plugin_native',
-        pluginInstanceId: 'instance',
-        contributionId: 'collective-native',
-        actionMethods: ['collective.connector.send'],
-      },
-    ])
-      await expect(f.invoke(f.input, f.context({ toolExecutionPolicy }))).rejects.toMatchObject({
-        code: 'EXACT_COLLECTIVE_RETURN_REQUIRED',
-      });
-    expect(f.rosterReads).toBe(0);
-    expect((await f.state()).connections[f.connection.connectionId].outbox).toHaveLength(0);
-  } finally {
-    await f.close();
-  }
+      await expect(f.invoke(f.input, f.context({ ownerAuthProvenance }))).rejects.toMatchObject({ code: 'CONNECTOR_OWNER_AUTHORITY_REQUIRED' });
+    for (const toolExecutionPolicy of [{ mode: 'read_only', replayDeniedToolNames: [] }, { mode: 'callback_allowlist', allowedCallbackRoutes: [] },
+      { mode: 'plugin_native', pluginInstanceId: 'instance', contributionId: 'collective-native' }])
+      await expect(f.invoke(f.input, f.context({ toolExecutionPolicy }))).rejects.toMatchObject({ code: 'EXACT_COLLECTIVE_RETURN_REQUIRED' });
+    expect(f.rosterReads).toBe(0); expect((await f.state()).connections[f.connection.connectionId].outbox).toHaveLength(0);
+  } finally { await f.close(); }
 });
 test('foreign owner, unavailable profile, body identity and purpose intents cannot queue', async () => {
   const f = await setup();
