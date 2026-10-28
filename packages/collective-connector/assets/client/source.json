@@ -1,14 +1,14 @@
 {
   "repository": "zts212653/cat-cafe",
-  "sourceBaseHead": "5f055fcc907a67f015bceb84500256d8ad41e65d",
+  "sourceBaseHead": "59416a3e7f7126a8f938732f7226ba27891292b0",
   "sourceState": "exact-source-head",
   "package": "packages/collective-client",
   "buildEntrypoint": "packages/collective-client/scripts/build.mjs#buildRetainedClient",
-  "assetDigest": "e4f49753dad6bb564d6b534d28493141d91b32cee17dae2c0982939cdb5ae7a1",
-  "buildInputsSha256": "2659fd5605f5efa846a2dd7230c4cc57bd3834b38196f9e70a48623ce07acbf1",
-  "manifestSha256": "672b6aa1842d69727160d0356ddcd4801f55c0950377494d7101abd7447eb738",
+  "assetDigest": "b3c65ea2e47440b014b651f7ab67287a875720486fc5c1962b6be8c9d14dc10a",
+  "buildInputsSha256": "6fdc1ded02debc2f47d3743d6f61c1743d4f0017c383090ff67f082cbe0e61fd",
+  "manifestSha256": "9248b68889cfb434a086e03f2df870733649cb107e44bace671ec6f57fb51dcd",
   "inputOverrides": [],
   "dependencyInputs": "build-inputs.json",
-  "sourceCheckedInputCount": 542,
-  "sourceLockfileSha256": "e4c01b857e825657263bc6bf8b632e127800a99567ad6955b4eb657b1ca23a9f"
+  "sourceCheckedInputCount": 566,
+  "sourceLockfileSha256": "933300d712dac3c60559674280104992b718cb817ba9d2e12c2b3f149fc65b80"
 }
